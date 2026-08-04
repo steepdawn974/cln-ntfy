@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
+use chrono::DateTime;
 use serde_json::Value;
 
 use crate::NotificationEvent;
@@ -153,16 +154,43 @@ impl Template {
 }
 
 /// Parse a quoted string value: `"hello"` -> `hello`.
+///
+/// The escape sequences `\n` (newline) and `\t` (tab) are expanded to their
+/// literal characters. `\\` becomes a single backslash.
 fn parse_string_val(val: &str, line_no: usize) -> Result<String, anyhow::Error> {
     let val = val.trim();
     if val.len() >= 2 && val.starts_with('"') && val.ends_with('"') {
-        Ok(val[1..val.len() - 1].to_string())
+        let inner = &val[1..val.len() - 1];
+        Ok(unescape(inner))
     } else {
         anyhow::bail!(
             "Line {}: expected a quoted string like \"value\", got: {val}",
             line_no + 1
-        );
+        )
     }
+}
+
+/// Expand `\n`, `\t`, and `\\` escape sequences in a string.
+fn unescape(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => result.push('\n'),
+                Some('t') => result.push('\t'),
+                Some('\\') => result.push('\\'),
+                Some(other) => {
+                    result.push('\\');
+                    result.push(other);
+                }
+                None => result.push('\\'),
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
 }
 
 /// Parse a tags array: `["zap", "money"]` -> `["zap", "money"]`.
@@ -202,6 +230,12 @@ fn parse_tags_val(val: &str, line_no: usize) -> Result<Vec<String>, anyhow::Erro
 ///   `{{invoice_payment.msat}}` resolves `value["invoice_payment"]["msat"]`.
 ///   If the path doesn't exist, the placeholder is replaced with an empty
 ///   string.
+/// - `{{path / 1000}}` — arithmetic on a numeric path. Supports `+`, `-`,
+///   `*`, `/` with integer constants, left-to-right. e.g.
+///   `{{invoice_payment.msat / 1000}}` converts msat to sat.
+/// - `{{path | date}}` — converts a Unix epoch timestamp (integer or float)
+///   to `YYYY-MM-DD HH:MM:SS UTC`.
+/// - `{{path / 1000 | date}}` — arithmetic then filter, combined with `|`.
 fn substitute(tmpl: &str, value: &Value, event_name: &str, json: &str) -> String {
     let mut result = String::with_capacity(tmpl.len());
     let mut rest = tmpl;
@@ -210,12 +244,8 @@ fn substitute(tmpl: &str, value: &Value, event_name: &str, json: &str) -> String
         result.push_str(&rest[..start]);
         let after_start = &rest[start + 2..];
         if let Some(end) = after_start.find("}}") {
-            let key = after_start[..end].trim();
-            let replacement = match key {
-                "event" => event_name.to_string(),
-                "json" => json.to_string(),
-                _ => resolve_path(value, key),
-            };
+            let expr = after_start[..end].trim();
+            let replacement = evaluate_expr(expr, value, event_name, json);
             result.push_str(&replacement);
             rest = &after_start[end + 2..];
         } else {
@@ -226,6 +256,145 @@ fn substitute(tmpl: &str, value: &Value, event_name: &str, json: &str) -> String
     }
     result.push_str(rest);
     result
+}
+
+/// Evaluate a `{{...}}` expression, which may be a simple keyword, a path,
+/// a path with arithmetic, or a path with a filter.
+fn evaluate_expr(expr: &str, value: &Value, event_name: &str, json: &str) -> String {
+    // Special keywords.
+    if expr == "event" {
+        return event_name.to_string();
+    }
+    if expr == "json" {
+        return json.to_string();
+    }
+
+    // Split into expression part and filter part on `|`.
+    let (expr_part, filter) = match expr.split_once('|') {
+        Some((e, f)) => (e.trim(), f.trim()),
+        None => (expr, ""),
+    };
+
+    // Evaluate the arithmetic expression (or plain path).
+    let raw = evaluate_arithmetic(expr_part, value);
+
+    // Apply filter if present.
+    match filter {
+        "date" | "datetime" => format_date(&raw),
+        "" => raw,
+        other => {
+            log::warn!("Unknown template filter `{other}`");
+            raw
+        }
+    }
+}
+
+/// Evaluate an expression that may contain arithmetic operations.
+///
+/// Supports a dotted path followed by zero or more `op number` pairs,
+/// evaluated left-to-right. e.g. `invoice_payment.msat / 1000` or
+/// `forward_event.in_msat / 1000 * 2`.
+fn evaluate_arithmetic(expr: &str, value: &Value) -> String {
+    let tokens: Vec<&str> = expr.split_whitespace().collect();
+    if tokens.is_empty() {
+        return String::new();
+    }
+
+    // First token is the path.
+    let path = tokens[0];
+
+    // If there are no operators, return the raw path value (preserving the
+    // original string representation, e.g. "10000msat").
+    if tokens.len() == 1 {
+        return resolve_path(value, path);
+    }
+
+    // There are operators — resolve the path to a number for arithmetic.
+    let mut current = match resolve_numeric(value, path) {
+        Some(n) => n,
+        None => return resolve_path(value, path),
+    };
+
+    // Remaining tokens come in pairs: operator, number.
+    let mut i = 1;
+    while i + 1 < tokens.len() {
+        let op = tokens[i];
+        let n: i64 = match tokens[i + 1].parse() {
+            Ok(n) => n,
+            Err(_) => {
+                log::warn!(
+                    "Template: cannot parse `{}` as number in expression `{expr}`",
+                    tokens[i + 1]
+                );
+                return current.to_string();
+            }
+        };
+        current = match op {
+            "/" => {
+                if n == 0 {
+                    log::warn!("Template: division by zero in `{expr}`");
+                    current
+                } else {
+                    current / n
+                }
+            }
+            "*" => current * n,
+            "+" => current + n,
+            "-" => current - n,
+            other => {
+                log::warn!("Template: unknown operator `{other}` in `{expr}`");
+                return current.to_string();
+            }
+        };
+        i += 2;
+    }
+
+    current.to_string()
+}
+
+/// Resolve a dotted path to a numeric value (`i64`).
+///
+/// Handles both integer JSON values and string values that contain a number
+/// (optionally with a `msat` suffix, which is stripped).
+fn resolve_numeric(value: &Value, path: &str) -> Option<i64> {
+    let mut current = value;
+    for part in path.split('.') {
+        current = current.get(part)?;
+    }
+    match current {
+        Value::Number(n) => n.as_i64(),
+        Value::String(s) => {
+            let s = s.strip_suffix("msat").unwrap_or(s);
+            s.parse().ok()
+        }
+        _ => None,
+    }
+}
+
+/// Convert a Unix epoch timestamp string to a human-readable UTC datetime.
+fn format_date(ts_str: &str) -> String {
+    let ts_str = ts_str.trim();
+    // Handle both integer and float timestamps.
+    let secs: i64 = match ts_str.parse() {
+        Ok(n) => n,
+        Err(_) => {
+            // Try parsing as float and truncating.
+            match ts_str.parse::<f64>() {
+                Ok(f) => f as i64,
+                Err(_) => {
+                    log::warn!("Template: cannot parse `{ts_str}` as Unix timestamp");
+                    return ts_str.to_string();
+                }
+            }
+        }
+    };
+    match chrono::DateTime::from_timestamp(secs, 0) {
+        Some(dt) => dt.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+        None => {
+            log::warn!("Template: timestamp {secs} out of range");
+            ts_str.to_string()
+        }
+    }
 }
 
 /// Resolve a dotted path like `invoice_payment.msat` against a JSON value.
@@ -360,5 +529,244 @@ message = "Block #{{block_added.height}}"
 unknown_key = "value"
 "#;
         assert!(Template::parse(content).is_err());
+    }
+
+    #[test]
+    fn arithmetic_division() {
+        let content = r#"
+[invoice_payment]
+message = "+{{invoice_payment.msat / 1000}} sat"
+"#;
+        let tmpl = Template::parse(content).unwrap();
+        // msat as string with "msat" suffix
+        let value = serde_json::json!({"invoice_payment": {"msat": "10000msat"}});
+        let rendered = tmpl
+            .render(NotificationEvent::InvoicePayment, &value)
+            .unwrap();
+        assert_eq!(rendered.message.as_deref(), Some("+10 sat"));
+
+        // msat as integer
+        let value = serde_json::json!({"invoice_payment": {"msat": 25000}});
+        let rendered = tmpl
+            .render(NotificationEvent::InvoicePayment, &value)
+            .unwrap();
+        assert_eq!(rendered.message.as_deref(), Some("+25 sat"));
+    }
+
+    #[test]
+    fn arithmetic_multiple_ops() {
+        let content = r#"
+[forward_event]
+message = "{{forward_event.in_msat / 1000 * 2}}"
+"#;
+        let tmpl = Template::parse(content).unwrap();
+        let value = serde_json::json!({"forward_event": {"in_msat": "50000msat"}});
+        let rendered = tmpl
+            .render(NotificationEvent::ForwardEvent, &value)
+            .unwrap();
+        assert_eq!(rendered.message.as_deref(), Some("100"));
+    }
+
+    #[test]
+    fn date_filter() {
+        let content = r#"
+[forward_event]
+message = "{{forward_event.received_time | date}}"
+"#;
+        let tmpl = Template::parse(content).unwrap();
+        let value = serde_json::json!({"forward_event": {"received_time": 1691160000}});
+        let rendered = tmpl
+            .render(NotificationEvent::ForwardEvent, &value)
+            .unwrap();
+        assert_eq!(rendered.message.as_deref(), Some("2023-08-04 14:40:00 UTC"));
+    }
+
+    #[test]
+    fn date_filter_with_float() {
+        let content = r#"
+[forward_event]
+message = "{{forward_event.received_time | date}}"
+"#;
+        let tmpl = Template::parse(content).unwrap();
+        let value = serde_json::json!({"forward_event": {"received_time": 1691160000.5}});
+        let rendered = tmpl
+            .render(NotificationEvent::ForwardEvent, &value)
+            .unwrap();
+        assert_eq!(rendered.message.as_deref(), Some("2023-08-04 14:40:00 UTC"));
+    }
+
+    #[test]
+    fn arithmetic_then_date_filter() {
+        let content = r#"
+[forward_event]
+message = "{{forward_event.received_time / 1000 | date}}"
+"#;
+        let tmpl = Template::parse(content).unwrap();
+        // 1691160000000 ms -> /1000 -> 1691160000 -> 2023-08-04
+        let value = serde_json::json!({"forward_event": {"received_time": 1691160000000i64}});
+        let rendered = tmpl
+            .render(NotificationEvent::ForwardEvent, &value)
+            .unwrap();
+        assert_eq!(rendered.message.as_deref(), Some("2023-08-04 14:40:00 UTC"));
+    }
+
+    #[test]
+    fn division_by_zero_is_safe() {
+        let content = r#"
+[invoice_payment]
+message = "{{invoice_payment.msat / 0}}"
+"#;
+        let tmpl = Template::parse(content).unwrap();
+        let value = serde_json::json!({"invoice_payment": {"msat": 10000}});
+        let rendered = tmpl
+            .render(NotificationEvent::InvoicePayment, &value)
+            .unwrap();
+        // Should return the original value, not crash.
+        assert_eq!(rendered.message.as_deref(), Some("10000"));
+    }
+
+    #[test]
+    fn multiline_message_with_escape() {
+        let content = r#"
+[forward_event]
+title = "Forward {{forward_event.status}}"
+message = "In: {{forward_event.in_msat / 1000}} sat\nOut: {{forward_event.out_msat / 1000}} sat\nFee: {{forward_event.fee_msat / 1000}} sat\nTime: {{forward_event.received_time | date}}"
+tags = ["repeat"]
+"#;
+        let tmpl = Template::parse(content).unwrap();
+        let value = serde_json::json!({
+            "forward_event": {
+                "status": "settled",
+                "in_msat": "50000msat",
+                "out_msat": "49000msat",
+                "fee_msat": "1000msat",
+                "received_time": 1691160000
+            }
+        });
+        let rendered = tmpl
+            .render(NotificationEvent::ForwardEvent, &value)
+            .unwrap();
+        assert_eq!(rendered.title.as_deref(), Some("Forward settled"));
+        assert_eq!(
+            rendered.message.as_deref(),
+            Some("In: 50 sat\nOut: 49 sat\nFee: 1 sat\nTime: 2023-08-04 14:40:00 UTC")
+        );
+    }
+
+    #[test]
+    fn unescape_tab_and_backslash() {
+        assert_eq!(unescape("a\\tb\\nc"), "a\tb\nc");
+        assert_eq!(unescape("path\\\\file"), "path\\file");
+        assert_eq!(unescape("no escapes"), "no escapes");
+        assert_eq!(unescape("trailing\\"), "trailing\\");
+        assert_eq!(unescape("unknown\\x"), "unknown\\x");
+    }
+
+    #[test]
+    fn unescape_in_message() {
+        let content = r#"
+[default]
+message = "col1\tcol2\nline2"
+"#;
+        let tmpl = Template::parse(content).unwrap();
+        let value = serde_json::json!({});
+        let rendered = tmpl.render(NotificationEvent::BlockAdded, &value).unwrap();
+        assert_eq!(rendered.message.as_deref(), Some("col1\tcol2\nline2"));
+    }
+
+    #[test]
+    fn arithmetic_addition_and_subtraction() {
+        let content = r#"
+[default]
+message = "{{default.x + 100}} and {{default.y - 50}}"
+"#;
+        let tmpl = Template::parse(content).unwrap();
+        let value = serde_json::json!({"default": {"x": 200, "y": 100}});
+        let rendered = tmpl.render(NotificationEvent::BlockAdded, &value).unwrap();
+        assert_eq!(rendered.message.as_deref(), Some("300 and 50"));
+    }
+
+    #[test]
+    fn arithmetic_strips_msat_suffix() {
+        let content = r#"
+[invoice_payment]
+message = "{{invoice_payment.msat / 1000}}"
+"#;
+        let tmpl = Template::parse(content).unwrap();
+        let value = serde_json::json!({"invoice_payment": {"msat": "123456msat"}});
+        let rendered = tmpl
+            .render(NotificationEvent::InvoicePayment, &value)
+            .unwrap();
+        assert_eq!(rendered.message.as_deref(), Some("123"));
+    }
+
+    #[test]
+    fn date_filter_invalid_input() {
+        // Non-numeric string passed to date filter should return the raw string.
+        let content = r#"
+[default]
+message = "{{default.bad | date}}"
+"#;
+        let tmpl = Template::parse(content).unwrap();
+        let value = serde_json::json!({"default": {"bad": "not-a-timestamp"}});
+        let rendered = tmpl.render(NotificationEvent::BlockAdded, &value).unwrap();
+        assert_eq!(rendered.message.as_deref(), Some("not-a-timestamp"));
+    }
+
+    #[test]
+    fn unknown_filter_returns_raw() {
+        let content = r#"
+[default]
+message = "{{default.x | uppercase}}"
+"#;
+        let tmpl = Template::parse(content).unwrap();
+        let value = serde_json::json!({"default": {"x": 42}});
+        let rendered = tmpl.render(NotificationEvent::BlockAdded, &value).unwrap();
+        // Unknown filter falls back to the raw value.
+        assert_eq!(rendered.message.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn plain_path_preserves_msat_suffix() {
+        // Without arithmetic, the raw string value (including "msat") is kept.
+        let content = r#"
+[invoice_payment]
+message = "{{invoice_payment.msat}}"
+"#;
+        let tmpl = Template::parse(content).unwrap();
+        let value = serde_json::json!({"invoice_payment": {"msat": "10000msat"}});
+        let rendered = tmpl
+            .render(NotificationEvent::InvoicePayment, &value)
+            .unwrap();
+        assert_eq!(rendered.message.as_deref(), Some("10000msat"));
+    }
+
+    #[test]
+    fn template_load_from_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("cln_ntfy_test_template.conf");
+        let content = "\n[default]\ntitle = \"Test\"\nmessage = \"Hello {{default.name}}\"\n";
+        std::fs::write(&path, content).unwrap();
+
+        let tmpl = Template::load(&path).unwrap();
+        let value = serde_json::json!({"default": {"name": "world"}});
+        let rendered = tmpl.render(NotificationEvent::BlockAdded, &value).unwrap();
+        assert_eq!(rendered.title.as_deref(), Some("Test"));
+        assert_eq!(rendered.message.as_deref(), Some("Hello world"));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn template_load_missing_file_errors() {
+        let path = std::path::Path::new("/nonexistent/path/template.conf");
+        assert!(Template::load(path).is_err());
+    }
+
+    #[test]
+    fn empty_template_renders_none() {
+        let tmpl = Template::parse("").unwrap();
+        let value = serde_json::json!({});
+        assert!(tmpl.render(NotificationEvent::BlockAdded, &value).is_none());
     }
 }

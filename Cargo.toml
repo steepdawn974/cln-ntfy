@@ -13,6 +13,7 @@ keywords = ["cln", "ntfy", "bitcoin", "lightning"]
 
 [dependencies]
 anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 log = "0.4"
 ntfy = { version = "0.9", features = ["socks"] }
 serde_json = "1"

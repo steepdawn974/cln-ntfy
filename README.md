@@ -143,14 +143,19 @@ title = "CLN: {{event}}"
 # Per-event overrides
 [invoice_payment]
 title = "Payment received"
-message = "+{{invoice_payment.msat}} msat ({{invoice_payment.label}})"
+message = "+{{invoice_payment.msat / 1000}} sat ({{invoice_payment.label}})"
 tags = ["zap", "money"]
 
+# Multiline message using \n
 [forward_event]
 title = "Forward {{forward_event.status}}"
-message = "In: {{forward_event.in_msat}}, Fee: {{forward_event.fee_msat}}"
+message = "In: {{forward_event.in_msat / 1000}} sat\nOut: {{forward_event.out_msat / 1000}} sat\nFee: {{forward_event.fee_msat / 1000}} sat\nTime: {{forward_event.received_time | date}}"
 tags = ["repeat"]
 ```
+
+### Multiline messages
+
+Use `\n` in any string value to insert a line break. `\t` inserts a tab, and `\\` inserts a literal backslash.
 
 ### Placeholders
 
@@ -159,6 +164,25 @@ tags = ["repeat"]
 | `{{event}}` | The event name, e.g. `invoice_payment` |
 | `{{json}}` | The full raw notification JSON. **Warning:** this can contain sensitive data — payment preimages, invoice labels/descriptions, on-chain UTXOs/txids (`coin_movement`), and peer IDs. Only use it with a trusted, access-restricted ntfy server and an unguessable topic, never a public topic on a shared server. |
 | `{{path.to.field}}` | Dotted path into the notification JSON, e.g. `{{invoice_payment.msat}}` resolves `value["invoice_payment"]["msat"]`. Missing paths resolve to an empty string. |
+
+### Arithmetic
+
+Numeric paths support `+`, `-`, `*`, `/` with integer constants, evaluated left-to-right. The `msat` suffix is auto-stripped from string values before arithmetic.
+
+| Expression | Result (for `msat = "10000msat"`) |
+| --- | --- |
+| `{{invoice_payment.msat / 1000}}` | `10` (sat) |
+| `{{invoice_payment.msat / 1000 * 2}}` | `20` |
+| `{{invoice_payment.msat + 500}}` | `10500` |
+
+### Date filter
+
+Append `| date` to convert a Unix epoch timestamp to `YYYY-MM-DD HH:MM:SS UTC`:
+
+| Expression | Result (for `received_time = 1691160000`) |
+| --- | --- |
+| `{{forward_event.received_time \| date}}` | `2023-08-04 14:40:00 UTC` |
+| `{{forward_event.received_time / 1000 \| date}}` | Arithmetic first, then date formatting |
 
 Available event sections: `channel_opened`, `channel_state_changed`, `connect`, `disconnect`, `invoice_creation`, `invoice_payment`, `forward_event`, `sendpay_success`, `sendpay_failure`, `coin_movement`, `warning`, `block_added`, and `default`.
 

@@ -301,3 +301,46 @@ pub async fn block_added_handler(p: Plugin<PluginState>, v: Value) -> Result<(),
     );
     send(&p, NotificationEvent::BlockAdded, payload).await
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn extract_amount_string_msat() {
+        let v = serde_json::json!({"invoice_payment": {"msat": "21000msat"}});
+        assert_eq!(extract_amount(&v, "invoice_payment").unwrap(), 21);
+    }
+
+    #[test]
+    fn extract_amount_integer_msat() {
+        // Issue #10: newer CLN sends msat as an integer, not a string.
+        let v = serde_json::json!({"invoice_payment": {"msat": 21000}});
+        assert_eq!(extract_amount(&v, "invoice_payment").unwrap(), 21);
+    }
+
+    #[test]
+    fn extract_amount_large_integer() {
+        let v = serde_json::json!({"invoice_payment": {"msat": 1000000000}});
+        assert_eq!(extract_amount(&v, "invoice_payment").unwrap(), 1000000);
+    }
+
+    #[test]
+    fn extract_amount_truncates_remainder() {
+        // 10500 msat = 10 sat (truncated, not rounded).
+        let v = serde_json::json!({"invoice_payment": {"msat": "10500msat"}});
+        assert_eq!(extract_amount(&v, "invoice_payment").unwrap(), 10);
+    }
+
+    #[test]
+    fn extract_amount_null_errors() {
+        let v = serde_json::json!({"invoice_payment": {"msat": null}});
+        assert!(extract_amount(&v, "invoice_payment").is_err());
+    }
+
+    #[test]
+    fn extract_amount_missing_key_errors() {
+        let v = serde_json::json!({"invoice_payment": {}});
+        assert!(extract_amount(&v, "invoice_payment").is_err());
+    }
+}
