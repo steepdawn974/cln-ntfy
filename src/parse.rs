@@ -2,6 +2,7 @@
 // Distributed under the MIT software license
 
 use std::collections::HashSet;
+use std::path::Path;
 
 use anyhow::anyhow;
 use cln_plugin::ConfiguredPlugin;
@@ -9,8 +10,9 @@ use ntfy::{Auth, dispatcher::builder::DispatcherBuilder};
 use url::Url;
 
 use crate::{
-    NotificationEvent, OPT_NTFY_EVENTS, OPT_NTFY_PASSWORD, OPT_NTFY_PROXY, OPT_NTFY_TOKEN,
-    OPT_NTFY_TOPIC, OPT_NTFY_URL, OPT_NTFY_USERNAME, PluginState,
+    NotificationEvent, OPT_NTFY_EVENTS, OPT_NTFY_PASSWORD, OPT_NTFY_PROXY, OPT_NTFY_TEMPLATE_FILE,
+    OPT_NTFY_TOKEN, OPT_NTFY_TOPIC, OPT_NTFY_URL, OPT_NTFY_USERNAME, PluginState,
+    template::Template,
 };
 
 /// Parse and validate all startup options, building the [`PluginState`].
@@ -104,10 +106,20 @@ pub fn get_startup_options(
     }
     let dispatcher = builder.build_async()?;
 
+    // -- ntfy-template-file (optional) -----------------------------------------
+    let template: Option<Template> = match plugin.option(&OPT_NTFY_TEMPLATE_FILE)? {
+        Some(path) if !path.is_empty() => {
+            log::info!("Loading ntfy template from {path}");
+            Some(Template::load(Path::new(&path))?)
+        }
+        _ => None,
+    };
+
     Ok(PluginState {
         dispatcher,
         topic,
         events,
+        template,
     })
 }
 

@@ -3,6 +3,7 @@
 
 use cln_plugin::{Error, Plugin};
 use ntfy::Payload;
+use serde_json::Value;
 
 use crate::{NotificationEvent, PluginState, util::format};
 
@@ -26,154 +27,281 @@ async fn send(
     Ok(())
 }
 
-/// Extract an amount in satoshi from a notification payload.
-///
-/// CLN reports amounts as a string ending in `msat` (e.g. `"21000msat"`).
-/// `key` is the top-level notification field holding the `msat` value.
-fn extract_amount(value: &serde_json::Value, key: &str) -> Result<u64, Error> {
-    let amount_msat = &value[key]["msat"];
-    let amount_str: String = serde_json::from_value(amount_msat.clone())?;
-    let amount: usize = amount_str[..amount_str.len() - 4].parse()?;
-    Ok((amount / 1000) as u64)
+/// Build a [`Payload`] either from the user's template (if configured for this
+/// event) or from the built-in default. The `event_name` and raw `value` are
+/// always available as template variables.
+fn build_payload(
+    p: &Plugin<PluginState>,
+    event: NotificationEvent,
+    value: &Value,
+    default_title: &str,
+    default_message: Option<&str>,
+    default_tags: &[&str],
+) -> Payload {
+    // Try the user template first.
+    if let Some(ref tmpl) = p.state().template {
+        if let Some(rendered) = tmpl.render(event, value) {
+            let mut payload = Payload::new(&p.state().topic);
+            if let Some(t) = rendered.title {
+                payload = payload.title(t);
+            }
+            if let Some(m) = rendered.message {
+                payload = payload.message(m);
+            }
+            if !rendered.tags.is_empty() {
+                payload = payload.tags(rendered.tags.iter().map(|s| s.as_str()));
+            }
+            return payload;
+        }
+    }
+
+    // Fall back to the built-in default.
+    let mut payload = Payload::new(&p.state().topic).title(default_title);
+    if let Some(msg) = default_message {
+        payload = payload.message(msg);
+    }
+    payload = payload.tags(default_tags.iter().copied());
+    payload
 }
 
-pub async fn channel_opened_handler(
-    p: Plugin<PluginState>,
-    v: serde_json::Value,
-) -> Result<(), Error> {
+/// Extract an amount in satoshi from a notification payload.
+///
+/// CLN reports amounts under `value[key]["msat"]`. Depending on the CLN
+/// version and notification, `msat` may be:
+/// - a string ending in `msat` (e.g. `"21000msat"`) — older format
+/// - an integer (e.g. `21000`) — newer format (see issue #10)
+///
+/// Returns the amount in whole satoshi (truncated, not rounded).
+fn extract_amount(value: &Value, key: &str) -> Result<u64, Error> {
+    let msat_val = &value[key]["msat"];
+    match msat_val {
+        Value::String(s) => {
+            // Strip the trailing "msat" suffix and parse.
+            let trimmed = s.strip_suffix("msat").unwrap_or(s);
+            let amount: u64 = trimmed.parse()?;
+            Ok(amount / 1000)
+        }
+        Value::Number(n) => {
+            let amount: u64 = n
+                .as_u64()
+                .ok_or_else(|| cln_plugin::anyhow!("msat value is not a valid u64: {n}"))?;
+            Ok(amount / 1000)
+        }
+        _ => Err(cln_plugin::anyhow!(
+            "msat value has unexpected type: {msat_val}"
+        )),
+    }
+}
+
+/// Extract a string field from a notification payload, returning None if
+/// missing or not a string.
+fn extract_str(value: &Value, key: &str) -> Option<String> {
+    value[key].as_str().map(|s| s.to_string())
+}
+
+pub async fn channel_opened_handler(p: Plugin<PluginState>, v: Value) -> Result<(), Error> {
     log::debug!("Got a channel opened notification: {v}");
-    let payload = Payload::new(&p.state().topic)
-        .title("New channel opened")
-        .tags(["white_check_mark"]);
+    let amount = extract_amount(&v, "channel_opened").ok();
+    let msg = match amount {
+        Some(a) => format!("Channel opened with +{} sat", format::number(a)),
+        None => "Channel opened".to_string(),
+    };
+    let payload = build_payload(
+        &p,
+        NotificationEvent::ChannelOpened,
+        &v,
+        "New channel opened",
+        Some(&msg),
+        &["white_check_mark"],
+    );
     send(&p, NotificationEvent::ChannelOpened, payload).await
 }
 
-pub async fn channel_state_changed_handler(
-    p: Plugin<PluginState>,
-    v: serde_json::Value,
-) -> Result<(), Error> {
+pub async fn channel_state_changed_handler(p: Plugin<PluginState>, v: Value) -> Result<(), Error> {
     log::debug!("Got a channel state changed notification: {v}");
-    let payload = Payload::new(&p.state().topic)
-        .title("Channel state changed")
-        .tags(["arrows_counterclockwise"]);
+    let old_state = extract_str(&v, "channel_state_changed").unwrap_or_default();
+    let new_state = v["channel_state_changed"]["new_state"]
+        .as_str()
+        .unwrap_or("unknown");
+    let msg = format!("{old_state} -> {new_state}");
+    let payload = build_payload(
+        &p,
+        NotificationEvent::ChannelStateChanged,
+        &v,
+        "Channel state changed",
+        Some(&msg),
+        &["arrows_counterclockwise"],
+    );
     send(&p, NotificationEvent::ChannelStateChanged, payload).await
 }
 
-pub async fn connect_handler(p: Plugin<PluginState>, v: serde_json::Value) -> Result<(), Error> {
+pub async fn connect_handler(p: Plugin<PluginState>, v: Value) -> Result<(), Error> {
     log::debug!("Got a connect notification: {v}");
-    let payload = Payload::new(&p.state().topic)
-        .title("Peer connected")
-        .tags(["electric_plug"]);
+    let peer = v["connect"]["id"].as_str().unwrap_or("unknown");
+    let msg = format!("Peer connected: {peer}");
+    let payload = build_payload(
+        &p,
+        NotificationEvent::Connect,
+        &v,
+        "Peer connected",
+        Some(&msg),
+        &["electric_plug"],
+    );
     send(&p, NotificationEvent::Connect, payload).await
 }
 
-pub async fn disconnect_handler(p: Plugin<PluginState>, v: serde_json::Value) -> Result<(), Error> {
+pub async fn disconnect_handler(p: Plugin<PluginState>, v: Value) -> Result<(), Error> {
     log::debug!("Got a disconnect notification: {v}");
-    let payload = Payload::new(&p.state().topic)
-        .title("Peer disconnected")
-        .tags(["x"]);
+    let peer = v["disconnect"]["id"].as_str().unwrap_or("unknown");
+    let msg = format!("Peer disconnected: {peer}");
+    let payload = build_payload(
+        &p,
+        NotificationEvent::Disconnect,
+        &v,
+        "Peer disconnected",
+        Some(&msg),
+        &["x"],
+    );
     send(&p, NotificationEvent::Disconnect, payload).await
 }
 
-pub async fn invoice_creation_handler(
-    p: Plugin<PluginState>,
-    v: serde_json::Value,
-) -> Result<(), Error> {
+pub async fn invoice_creation_handler(p: Plugin<PluginState>, v: Value) -> Result<(), Error> {
     log::debug!("Got an invoice creation notification: {v}");
-    let payload = match extract_amount(&v, "invoice_creation") {
-        Ok(amount) => Payload::new(&p.state().topic)
-            .message(format!("+{} sat", format::number(amount)))
-            .title("New invoice created")
-            .tags(["hourglass"]),
-        Err(e) => {
-            log::warn!("Could not extract amount from invoice_creation: {e}");
-            Payload::new(&p.state().topic)
-                .title("New invoice created")
-                .tags(["hourglass"])
-        }
+    let msg = match extract_amount(&v, "invoice_creation") {
+        Ok(amount) => format!("+{} sat", format::number(amount)),
+        Err(_) => "Invoice created".to_string(),
     };
+    let payload = build_payload(
+        &p,
+        NotificationEvent::InvoiceCreation,
+        &v,
+        "New invoice created",
+        Some(&msg),
+        &["hourglass"],
+    );
     send(&p, NotificationEvent::InvoiceCreation, payload).await
 }
 
-pub async fn invoice_payment_handler(
-    p: Plugin<PluginState>,
-    v: serde_json::Value,
-) -> Result<(), Error> {
+pub async fn invoice_payment_handler(p: Plugin<PluginState>, v: Value) -> Result<(), Error> {
     log::debug!("Got an invoice payment notification: {v}");
-    let payload = match extract_amount(&v, "invoice_payment") {
-        Ok(amount) => Payload::new(&p.state().topic)
-            .message(format!("+{} sat", format::number(amount)))
-            .title("New payment received")
-            .tags(["zap"]),
-        Err(e) => {
-            log::warn!("Could not extract amount from invoice_payment: {e}");
-            Payload::new(&p.state().topic)
-                .title("New payment received")
-                .tags(["zap"])
-        }
+    let msg = match extract_amount(&v, "invoice_payment") {
+        Ok(amount) => format!("+{} sat", format::number(amount)),
+        Err(_) => "Payment received".to_string(),
     };
+    let payload = build_payload(
+        &p,
+        NotificationEvent::InvoicePayment,
+        &v,
+        "New payment received",
+        Some(&msg),
+        &["zap"],
+    );
     send(&p, NotificationEvent::InvoicePayment, payload).await
 }
 
-pub async fn forward_event_handler(
-    p: Plugin<PluginState>,
-    v: serde_json::Value,
-) -> Result<(), Error> {
+pub async fn forward_event_handler(p: Plugin<PluginState>, v: Value) -> Result<(), Error> {
     log::debug!("Got a forward event notification: {v}");
-    let payload = Payload::new(&p.state().topic)
-        .title("Forward event")
-        .tags(["repeat"]);
+    let fwd = &v["forward_event"];
+    let status = fwd["status"].as_str().unwrap_or("unknown");
+    let in_amount = extract_amount(&v, "forward_event").ok();
+    let fee = fwd["fee_msat"]
+        .as_str()
+        .and_then(|s| s.strip_suffix("msat"))
+        .and_then(|s| s.parse::<u64>().ok())
+        .or_else(|| fwd["fee_msat"].as_u64())
+        .map(|f| f / 1000);
+
+    let msg = match (status, in_amount, fee) {
+        ("settled", Some(amt), Some(fee)) => {
+            format!(
+                "Forward settled: +{} sat in, +{} sat fee",
+                format::number(amt),
+                format::number(fee)
+            )
+        }
+        ("settled", Some(amt), None) => {
+            format!("Forward settled: +{} sat in", format::number(amt))
+        }
+        (_, Some(amt), _) => {
+            format!("Forward {status}: +{} sat in", format::number(amt))
+        }
+        _ => format!("Forward {status}"),
+    };
+    let payload = build_payload(
+        &p,
+        NotificationEvent::ForwardEvent,
+        &v,
+        "Forward event",
+        Some(&msg),
+        &["repeat"],
+    );
     send(&p, NotificationEvent::ForwardEvent, payload).await
 }
 
-pub async fn sendpay_success_handler(
-    p: Plugin<PluginState>,
-    v: serde_json::Value,
-) -> Result<(), Error> {
+pub async fn sendpay_success_handler(p: Plugin<PluginState>, v: Value) -> Result<(), Error> {
     log::debug!("Got a sendpay success notification: {v}");
-    let payload = Payload::new(&p.state().topic)
-        .title("Payment sent")
-        .tags(["outbox_tray"]);
+    let payload = build_payload(
+        &p,
+        NotificationEvent::SendpaySuccess,
+        &v,
+        "Payment sent",
+        None,
+        &["outbox_tray"],
+    );
     send(&p, NotificationEvent::SendpaySuccess, payload).await
 }
 
-pub async fn sendpay_failure_handler(
-    p: Plugin<PluginState>,
-    v: serde_json::Value,
-) -> Result<(), Error> {
+pub async fn sendpay_failure_handler(p: Plugin<PluginState>, v: Value) -> Result<(), Error> {
     log::debug!("Got a sendpay failure notification: {v}");
-    let payload = Payload::new(&p.state().topic)
-        .title("Payment failed")
-        .tags(["warning"]);
+    let payload = build_payload(
+        &p,
+        NotificationEvent::SendpayFailure,
+        &v,
+        "Payment failed",
+        None,
+        &["warning"],
+    );
     send(&p, NotificationEvent::SendpayFailure, payload).await
 }
 
-pub async fn coin_movement_handler(
-    p: Plugin<PluginState>,
-    v: serde_json::Value,
-) -> Result<(), Error> {
+pub async fn coin_movement_handler(p: Plugin<PluginState>, v: Value) -> Result<(), Error> {
     log::debug!("Got a coin movement notification: {v}");
-    let payload = Payload::new(&p.state().topic)
-        .title("Coin movement")
-        .tags(["coin"]);
+    let payload = build_payload(
+        &p,
+        NotificationEvent::CoinMovement,
+        &v,
+        "Coin movement",
+        None,
+        &["coin"],
+    );
     send(&p, NotificationEvent::CoinMovement, payload).await
 }
 
-pub async fn warning_handler(p: Plugin<PluginState>, v: serde_json::Value) -> Result<(), Error> {
+pub async fn warning_handler(p: Plugin<PluginState>, v: Value) -> Result<(), Error> {
     log::debug!("Got a warning notification: {v}");
-    let payload = Payload::new(&p.state().topic)
-        .title("Warning")
-        .tags(["warning"]);
+    let msg = v["warning"]["message"].as_str().map(|s| s.to_string());
+    let payload = build_payload(
+        &p,
+        NotificationEvent::Warning,
+        &v,
+        "Warning",
+        msg.as_deref(),
+        &["warning"],
+    );
     send(&p, NotificationEvent::Warning, payload).await
 }
 
-pub async fn block_added_handler(
-    p: Plugin<PluginState>,
-    v: serde_json::Value,
-) -> Result<(), Error> {
+pub async fn block_added_handler(p: Plugin<PluginState>, v: Value) -> Result<(), Error> {
     log::debug!("Got a block added notification: {v}");
-    let payload = Payload::new(&p.state().topic)
-        .title("New block added")
-        .tags(["bricks"]);
+    let height = v["block_added"]["height"].as_u64();
+    let msg = height.map(|h| format!("Block #{h}"));
+    let payload = build_payload(
+        &p,
+        NotificationEvent::BlockAdded,
+        &v,
+        "New block added",
+        msg.as_deref(),
+        &["bricks"],
+    );
     send(&p, NotificationEvent::BlockAdded, payload).await
 }

@@ -6,6 +6,8 @@ use std::collections::HashSet;
 use ntfy::Dispatcher;
 use ntfy::dispatcher::Async;
 
+use crate::template::Template;
+
 /// CLN notification events that can be forwarded to ntfy.
 ///
 /// The variant names match the notification names used by Core Lightning
@@ -78,4 +80,5 @@ pub struct PluginState {
     pub dispatcher: Dispatcher<Async>,
     pub topic: String,
     pub events: HashSet<NotificationEvent>,
+    pub template: Option<Template>,
 }

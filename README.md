@@ -54,6 +54,7 @@ ntfy-url=https://ntfy.sh
 | `ntfy-token` | _(none)_ | Access token for token auth. Mutually exclusive with `ntfy-username`/`ntfy-password`. |
 | `ntfy-proxy` | _(none)_ | Proxy URL, e.g. `socks5h://127.0.0.1:9050`. Required to reach a `.onion` ntfy URL. |
 | `ntfy-events` | `all` | Comma-separated list of CLN events to forward, `all`, or `none` (publishes nothing). See the table below. |
+| `ntfy-template-file` | _(none)_ | Path to a template file for custom message formatting. See [Templates](#templates) below. |
 
 ### Supported events
 
@@ -115,6 +116,50 @@ ntfy-url=http://ntfyxyzexample.onion
 ntfy-topic=my-node-alerts
 ntfy-proxy=socks5h://127.0.0.1:9050
 ```
+
+## Templates
+
+By default the plugin uses built-in message formats. You can customize the title, message body, and tags for each event type with a template file.
+
+### Enabling templates
+
+```
+ntfy-template-file=/home/bitcoin/.lightning/ntfy-template.conf
+```
+
+A sample template file (`ntfy-template.sample.conf`) is included in the repo. The install script copies it next to your CLN config automatically.
+
+### Template format
+
+The file is a simple line-based config with one section per event:
+
+```ini
+# Fallback for any event without its own section
+[default]
+title = "CLN: {{event}}"
+message = "{{json}}"
+
+# Per-event overrides
+[invoice_payment]
+title = "Payment received"
+message = "+{{invoice_payment.msat}} msat ({{invoice_payment.label}})"
+tags = ["zap", "money"]
+
+[forward_event]
+title = "Forward {{forward_event.status}}"
+message = "In: {{forward_event.in_msat}}, Fee: {{forward_event.fee_msat}}"
+tags = ["repeat"]
+```
+
+### Placeholders
+
+| Placeholder | Resolves to |
+| --- | --- |
+| `{{event}}` | The event name, e.g. `invoice_payment` |
+| `{{json}}` | The full raw notification JSON |
+| `{{path.to.field}}` | Dotted path into the notification JSON, e.g. `{{invoice_payment.msat}}` resolves `value["invoice_payment"]["msat"]`. Missing paths resolve to an empty string. |
+
+Available event sections: `channel_opened`, `channel_state_changed`, `connect`, `disconnect`, `invoice_creation`, `invoice_payment`, `forward_event`, `sendpay_success`, `sendpay_failure`, `coin_movement`, `warning`, `block_added`, and `default`.
 
 ## Behavior on misconfiguration
 

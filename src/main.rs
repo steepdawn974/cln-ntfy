@@ -16,6 +16,7 @@ use tokio::io::{stdin, stdout};
 mod notifications;
 mod parse;
 mod structs;
+mod template;
 mod util;
 
 const OPT_NTFY_URL: StringConfigOption =
@@ -40,7 +41,11 @@ const OPT_NTFY_PROXY: StringConfigOption = ConfigOption::new_str_no_default(
 const OPT_NTFY_EVENTS: DefaultStringConfigOption = ConfigOption::new_str_with_default(
     "ntfy-events",
     "all",
-    "comma-separated list of CLN events to forward, or `all`",
+    "comma-separated list of CLN events to forward, `all`, or `none`",
+);
+const OPT_NTFY_TEMPLATE_FILE: StringConfigOption = ConfigOption::new_str_no_default(
+    "ntfy-template-file",
+    "path to a template file for custom ntfy message formatting (optional)",
 );
 
 #[tokio::main]
@@ -57,6 +62,7 @@ async fn main() -> anyhow::Result<()> {
         .option(OPT_NTFY_TOKEN)
         .option(OPT_NTFY_PROXY)
         .option(OPT_NTFY_EVENTS)
+        .option(OPT_NTFY_TEMPLATE_FILE)
         // Subscribe to every supported event up front; the per-event filter
         // against `ntfy-events` happens in the dispatch handlers. This works
         // with `.dynamic()` since subscriptions must be registered before the
