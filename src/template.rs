@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use chrono::DateTime;
 use serde_json::Value;
 
 use crate::NotificationEvent;
