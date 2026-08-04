@@ -1,2 +1,4 @@
 /target
 .DS_Store
+mcp_*.log
+PLAN.md
