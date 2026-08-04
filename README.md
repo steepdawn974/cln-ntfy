@@ -56,6 +56,8 @@ ntfy-url=https://ntfy.sh
 | `ntfy-events` | `all` | Comma-separated list of CLN events to forward, `all`, or `none` (publishes nothing). See the table below. |
 | `ntfy-template-file` | _(none)_ | Path to a template file for custom message formatting. See [Templates](#templates) below. |
 
+If `ntfy-url` uses plain `http://` to a **remote** host while credentials (`ntfy-username`/`ntfy-password` or `ntfy-token`) are configured, the plugin logs a warning at startup since the credentials would be sent unencrypted. Loopback (`localhost`, `127.0.0.1`) and `.onion` hosts are exempt — plaintext is safe there.
+
 ### Supported events
 
 | Event name | Description |
@@ -137,7 +139,6 @@ The file is a simple line-based config with one section per event:
 # Fallback for any event without its own section
 [default]
 title = "CLN: {{event}}"
-message = "{{json}}"
 
 # Per-event overrides
 [invoice_payment]
@@ -156,7 +157,7 @@ tags = ["repeat"]
 | Placeholder | Resolves to |
 | --- | --- |
 | `{{event}}` | The event name, e.g. `invoice_payment` |
-| `{{json}}` | The full raw notification JSON |
+| `{{json}}` | The full raw notification JSON. **Warning:** this can contain sensitive data — payment preimages, invoice labels/descriptions, on-chain UTXOs/txids (`coin_movement`), and peer IDs. Only use it with a trusted, access-restricted ntfy server and an unguessable topic, never a public topic on a shared server. |
 | `{{path.to.field}}` | Dotted path into the notification JSON, e.g. `{{invoice_payment.msat}}` resolves `value["invoice_payment"]["msat"]`. Missing paths resolve to an empty string. |
 
 Available event sections: `channel_opened`, `channel_state_changed`, `connect`, `disconnect`, `invoice_creation`, `invoice_payment`, `forward_event`, `sendpay_success`, `sendpay_failure`, `coin_movement`, `warning`, `block_added`, and `default`.

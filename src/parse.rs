@@ -2,6 +2,7 @@
 // Distributed under the MIT software license
 
 use std::collections::HashSet;
+use std::net::IpAddr;
 use std::path::Path;
 
 use anyhow::anyhow;
@@ -95,6 +96,23 @@ pub fn get_startup_options(
     // -- ntfy-events (default "all") -------------------------------------------
     let events_str: String = plugin.option(&OPT_NTFY_EVENTS)?;
     let events: HashSet<NotificationEvent> = parse_events(&events_str)?;
+
+    // Warn when credentials would be sent over cleartext HTTP to a remote
+    // host. Plaintext is fine for loopback and .onion endpoints.
+    if (has_basic || has_token) && url.scheme() == "http" {
+        let host = url.host_str().unwrap_or_default();
+        let is_loopback = host == "localhost"
+            || host
+                .parse::<IpAddr>()
+                .map(|ip| ip.is_loopback())
+                .unwrap_or(false);
+        if !is_loopback && !host.ends_with(".onion") {
+            log::warn!(
+                "`{}` uses cleartext HTTP to a remote host: your ntfy credentials will be sent unencrypted. Use HTTPS, a .onion URL, or a local server.",
+                OPT_NTFY_URL.name()
+            );
+        }
+    }
 
     // -- build dispatcher ------------------------------------------------------
     let mut builder = DispatcherBuilder::new(url.to_string());

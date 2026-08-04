@@ -93,12 +93,6 @@ fn extract_amount(value: &Value, key: &str) -> Result<u64, Error> {
     }
 }
 
-/// Extract a string field from a notification payload, returning None if
-/// missing or not a string.
-fn extract_str(value: &Value, key: &str) -> Option<String> {
-    value[key].as_str().map(|s| s.to_string())
-}
-
 pub async fn channel_opened_handler(p: Plugin<PluginState>, v: Value) -> Result<(), Error> {
     log::debug!("Got a channel opened notification: {v}");
     let amount = extract_amount(&v, "channel_opened").ok();
@@ -119,7 +113,9 @@ pub async fn channel_opened_handler(p: Plugin<PluginState>, v: Value) -> Result<
 
 pub async fn channel_state_changed_handler(p: Plugin<PluginState>, v: Value) -> Result<(), Error> {
     log::debug!("Got a channel state changed notification: {v}");
-    let old_state = extract_str(&v, "channel_state_changed").unwrap_or_default();
+    let old_state = v["channel_state_changed"]["old_state"]
+        .as_str()
+        .unwrap_or("unknown");
     let new_state = v["channel_state_changed"]["new_state"]
         .as_str()
         .unwrap_or("unknown");

@@ -32,7 +32,7 @@ const OPT_NTFY_PASSWORD: StringConfigOption =
     ConfigOption::new_str_no_default("ntfy-password", "ntfy password (basic auth)");
 const OPT_NTFY_TOKEN: StringConfigOption = ConfigOption::new_str_no_default(
     "ntfy-token",
-    "nty access token (mutually exclusive with username/password)",
+    "ntfy access token (mutually exclusive with username/password)",
 );
 const OPT_NTFY_PROXY: StringConfigOption = ConfigOption::new_str_no_default(
     "ntfy-proxy",
