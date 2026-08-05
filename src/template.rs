@@ -16,6 +16,18 @@ pub struct RenderedPayload {
     pub tags: Vec<String>,
 }
 
+/// Outcome of a template render attempt.
+pub enum RenderResult {
+    /// The template produced a payload.
+    Render(RenderedPayload),
+    /// A matching section was found but its `filter` condition rejected the
+    /// event. The notification should be dropped entirely.
+    Filtered,
+    /// No template section matched this event. The caller should use the
+    /// built-in default formatting.
+    NoSection,
+}
+
 /// A user-defined message template loaded from a TOML-like file.
 ///
 /// The file is a simple line-based format (not full TOML, to avoid a heavy
@@ -46,6 +58,20 @@ struct TemplateSection {
     title: Option<String>,
     message: Option<String>,
     tags: Vec<String>,
+    filter: Option<Filter>,
+}
+
+#[derive(Debug, Clone)]
+struct Filter {
+    path: String,
+    op: FilterOp,
+    value: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FilterOp {
+    Equal,
+    NotEqual,
 }
 
 impl Template {
@@ -106,9 +132,13 @@ impl Template {
                 "tags" => {
                     current.tags = parse_tags_val(val, line_no)?;
                 }
+                "filter" => {
+                    let filter_str = parse_string_val(val, line_no)?;
+                    current.filter = Some(parse_filter(&filter_str, line_no + 1)?);
+                }
                 _ => {
                     anyhow::bail!(
-                        "Line {}: unknown key `{key}` (expected title, message, or tags)",
+                        "Line {}: unknown key `{key}` (expected title, message, tags, or filter)",
                         line_no + 1
                     );
                 }
@@ -123,18 +153,27 @@ impl Template {
         Ok(Template { sections })
     }
 
-    /// Render a payload for the given event, or `None` if no template section
-    /// matches (and the caller should use the built-in default).
-    pub fn render(&self, event: NotificationEvent, value: &Value) -> Option<RenderedPayload> {
-        let section = self
+    /// Render a payload for the given event.
+    pub fn render(&self, event: NotificationEvent, value: &Value) -> RenderResult {
+        let section = match self
             .sections
             .get(event.name())
-            .or_else(|| self.sections.get("default"))?;
+            .or_else(|| self.sections.get("default"))
+        {
+            Some(s) => s,
+            None => return RenderResult::NoSection,
+        };
+
+        if let Some(ref filter) = section.filter {
+            if !filter.matches(value) {
+                return RenderResult::Filtered;
+            }
+        }
 
         let event_name = event.name();
         let json = value.to_string();
 
-        Some(RenderedPayload {
+        RenderResult::Render(RenderedPayload {
             title: section
                 .title
                 .as_ref()
@@ -218,6 +257,45 @@ fn parse_tags_val(val: &str, line_no: usize) -> Result<Vec<String>, anyhow::Erro
         }
     }
     Ok(tags)
+}
+
+/// Parse a filter condition like `forward_event.status = settled`.
+fn parse_filter(s: &str, line_no: usize) -> Result<Filter, anyhow::Error> {
+    let s = s.trim();
+    let (op, path, val) = if let Some((p, v)) = s.split_once("!=") {
+        (FilterOp::NotEqual, p.trim(), v.trim())
+    } else if let Some((p, v)) = s.split_once('=') {
+        (FilterOp::Equal, p.trim(), v.trim())
+    } else {
+        anyhow::bail!(
+            "Line {}: filter must contain `=` or `!=`, got: {s}",
+            line_no
+        );
+    };
+
+    // The path is a dotted JSON accessor and must not contain an operator.
+    if path.contains('=') || path.contains('!') {
+        anyhow::bail!(
+            "Line {}: filter path may not contain `=` or `!`: {path}",
+            line_no
+        );
+    }
+
+    Ok(Filter {
+        path: path.to_string(),
+        op,
+        value: val.to_string(),
+    })
+}
+
+impl Filter {
+    fn matches(&self, value: &Value) -> bool {
+        let actual = resolve_path(value, &self.path);
+        match self.op {
+            FilterOp::Equal => actual == self.value,
+            FilterOp::NotEqual => actual != self.value,
+        }
+    }
 }
 
 /// Replace `{{...}}` placeholders in a template string.
@@ -457,9 +535,10 @@ tags = ["zap"]
                 "label": "test-label"
             }
         });
-        let rendered = tmpl
-            .render(NotificationEvent::InvoicePayment, &value)
-            .unwrap();
+        let rendered = match tmpl.render(NotificationEvent::InvoicePayment, &value) {
+            RenderResult::Render(r) => r,
+            _ => panic!("expected Render"),
+        };
         assert_eq!(rendered.title.as_deref(), Some("Payment received"));
         assert_eq!(
             rendered.message.as_deref(),
@@ -476,7 +555,10 @@ title = "CLN: {{event}}"
 "#;
         let tmpl = Template::parse(content).unwrap();
         let value = serde_json::json!({});
-        let rendered = tmpl.render(NotificationEvent::BlockAdded, &value).unwrap();
+        let rendered = match tmpl.render(NotificationEvent::BlockAdded, &value) {
+            RenderResult::Render(r) => r,
+            _ => panic!("expected Render"),
+        };
         assert_eq!(rendered.title.as_deref(), Some("CLN: block_added"));
     }
 
@@ -486,7 +568,10 @@ title = "CLN: {{event}}"
             sections: HashMap::new(),
         };
         let value = serde_json::json!({});
-        assert!(tmpl.render(NotificationEvent::BlockAdded, &value).is_none());
+        assert!(matches!(
+            tmpl.render(NotificationEvent::BlockAdded, &value),
+            RenderResult::NoSection
+        ));
     }
 
     #[test]
@@ -497,9 +582,10 @@ message = "{{invoice_payment.nonexistent}}"
 "#;
         let tmpl = Template::parse(content).unwrap();
         let value = serde_json::json!({"invoice_payment": {"msat": "1000msat"}});
-        let rendered = tmpl
-            .render(NotificationEvent::InvoicePayment, &value)
-            .unwrap();
+        let rendered = match tmpl.render(NotificationEvent::InvoicePayment, &value) {
+            RenderResult::Render(r) => r,
+            _ => panic!("expected Render"),
+        };
         assert_eq!(rendered.message.as_deref(), Some(""));
     }
 
@@ -511,7 +597,10 @@ message = "Block #{{block_added.height}}"
 "#;
         let tmpl = Template::parse(content).unwrap();
         let value = serde_json::json!({"block_added": {"height": 800000}});
-        let rendered = tmpl.render(NotificationEvent::BlockAdded, &value).unwrap();
+        let rendered = match tmpl.render(NotificationEvent::BlockAdded, &value) {
+            RenderResult::Render(r) => r,
+            _ => panic!("expected Render"),
+        };
         assert_eq!(rendered.message.as_deref(), Some("Block #800000"));
     }
 
@@ -539,16 +628,18 @@ message = "+{{invoice_payment.msat / 1000}} sat"
         let tmpl = Template::parse(content).unwrap();
         // msat as string with "msat" suffix
         let value = serde_json::json!({"invoice_payment": {"msat": "10000msat"}});
-        let rendered = tmpl
-            .render(NotificationEvent::InvoicePayment, &value)
-            .unwrap();
+        let rendered = match tmpl.render(NotificationEvent::InvoicePayment, &value) {
+            RenderResult::Render(r) => r,
+            _ => panic!("expected Render"),
+        };
         assert_eq!(rendered.message.as_deref(), Some("+10 sat"));
 
         // msat as integer
         let value = serde_json::json!({"invoice_payment": {"msat": 25000}});
-        let rendered = tmpl
-            .render(NotificationEvent::InvoicePayment, &value)
-            .unwrap();
+        let rendered = match tmpl.render(NotificationEvent::InvoicePayment, &value) {
+            RenderResult::Render(r) => r,
+            _ => panic!("expected Render"),
+        };
         assert_eq!(rendered.message.as_deref(), Some("+25 sat"));
     }
 
@@ -560,9 +651,10 @@ message = "{{forward_event.in_msat / 1000 * 2}}"
 "#;
         let tmpl = Template::parse(content).unwrap();
         let value = serde_json::json!({"forward_event": {"in_msat": "50000msat"}});
-        let rendered = tmpl
-            .render(NotificationEvent::ForwardEvent, &value)
-            .unwrap();
+        let rendered = match tmpl.render(NotificationEvent::ForwardEvent, &value) {
+            RenderResult::Render(r) => r,
+            _ => panic!("expected Render"),
+        };
         assert_eq!(rendered.message.as_deref(), Some("100"));
     }
 
@@ -574,9 +666,10 @@ message = "{{forward_event.received_time | date}}"
 "#;
         let tmpl = Template::parse(content).unwrap();
         let value = serde_json::json!({"forward_event": {"received_time": 1691160000}});
-        let rendered = tmpl
-            .render(NotificationEvent::ForwardEvent, &value)
-            .unwrap();
+        let rendered = match tmpl.render(NotificationEvent::ForwardEvent, &value) {
+            RenderResult::Render(r) => r,
+            _ => panic!("expected Render"),
+        };
         assert_eq!(rendered.message.as_deref(), Some("2023-08-04 14:40:00 UTC"));
     }
 
@@ -588,9 +681,10 @@ message = "{{forward_event.received_time | date}}"
 "#;
         let tmpl = Template::parse(content).unwrap();
         let value = serde_json::json!({"forward_event": {"received_time": 1691160000.5}});
-        let rendered = tmpl
-            .render(NotificationEvent::ForwardEvent, &value)
-            .unwrap();
+        let rendered = match tmpl.render(NotificationEvent::ForwardEvent, &value) {
+            RenderResult::Render(r) => r,
+            _ => panic!("expected Render"),
+        };
         assert_eq!(rendered.message.as_deref(), Some("2023-08-04 14:40:00 UTC"));
     }
 
@@ -603,9 +697,10 @@ message = "{{forward_event.received_time / 1000 | date}}"
         let tmpl = Template::parse(content).unwrap();
         // 1691160000000 ms -> /1000 -> 1691160000 -> 2023-08-04
         let value = serde_json::json!({"forward_event": {"received_time": 1691160000000i64}});
-        let rendered = tmpl
-            .render(NotificationEvent::ForwardEvent, &value)
-            .unwrap();
+        let rendered = match tmpl.render(NotificationEvent::ForwardEvent, &value) {
+            RenderResult::Render(r) => r,
+            _ => panic!("expected Render"),
+        };
         assert_eq!(rendered.message.as_deref(), Some("2023-08-04 14:40:00 UTC"));
     }
 
@@ -617,9 +712,10 @@ message = "{{invoice_payment.msat / 0}}"
 "#;
         let tmpl = Template::parse(content).unwrap();
         let value = serde_json::json!({"invoice_payment": {"msat": 10000}});
-        let rendered = tmpl
-            .render(NotificationEvent::InvoicePayment, &value)
-            .unwrap();
+        let rendered = match tmpl.render(NotificationEvent::InvoicePayment, &value) {
+            RenderResult::Render(r) => r,
+            _ => panic!("expected Render"),
+        };
         // Should return the original value, not crash.
         assert_eq!(rendered.message.as_deref(), Some("10000"));
     }
@@ -642,9 +738,10 @@ tags = ["repeat"]
                 "received_time": 1691160000
             }
         });
-        let rendered = tmpl
-            .render(NotificationEvent::ForwardEvent, &value)
-            .unwrap();
+        let rendered = match tmpl.render(NotificationEvent::ForwardEvent, &value) {
+            RenderResult::Render(r) => r,
+            _ => panic!("expected Render"),
+        };
         assert_eq!(rendered.title.as_deref(), Some("Forward settled"));
         assert_eq!(
             rendered.message.as_deref(),
@@ -669,7 +766,10 @@ message = "col1\tcol2\nline2"
 "#;
         let tmpl = Template::parse(content).unwrap();
         let value = serde_json::json!({});
-        let rendered = tmpl.render(NotificationEvent::BlockAdded, &value).unwrap();
+        let rendered = match tmpl.render(NotificationEvent::BlockAdded, &value) {
+            RenderResult::Render(r) => r,
+            _ => panic!("expected Render"),
+        };
         assert_eq!(rendered.message.as_deref(), Some("col1\tcol2\nline2"));
     }
 
@@ -681,7 +781,10 @@ message = "{{default.x + 100}} and {{default.y - 50}}"
 "#;
         let tmpl = Template::parse(content).unwrap();
         let value = serde_json::json!({"default": {"x": 200, "y": 100}});
-        let rendered = tmpl.render(NotificationEvent::BlockAdded, &value).unwrap();
+        let rendered = match tmpl.render(NotificationEvent::BlockAdded, &value) {
+            RenderResult::Render(r) => r,
+            _ => panic!("expected Render"),
+        };
         assert_eq!(rendered.message.as_deref(), Some("300 and 50"));
     }
 
@@ -693,9 +796,10 @@ message = "{{invoice_payment.msat / 1000}}"
 "#;
         let tmpl = Template::parse(content).unwrap();
         let value = serde_json::json!({"invoice_payment": {"msat": "123456msat"}});
-        let rendered = tmpl
-            .render(NotificationEvent::InvoicePayment, &value)
-            .unwrap();
+        let rendered = match tmpl.render(NotificationEvent::InvoicePayment, &value) {
+            RenderResult::Render(r) => r,
+            _ => panic!("expected Render"),
+        };
         assert_eq!(rendered.message.as_deref(), Some("123"));
     }
 
@@ -708,7 +812,10 @@ message = "{{default.bad | date}}"
 "#;
         let tmpl = Template::parse(content).unwrap();
         let value = serde_json::json!({"default": {"bad": "not-a-timestamp"}});
-        let rendered = tmpl.render(NotificationEvent::BlockAdded, &value).unwrap();
+        let rendered = match tmpl.render(NotificationEvent::BlockAdded, &value) {
+            RenderResult::Render(r) => r,
+            _ => panic!("expected Render"),
+        };
         assert_eq!(rendered.message.as_deref(), Some("not-a-timestamp"));
     }
 
@@ -720,7 +827,10 @@ message = "{{default.x | uppercase}}"
 "#;
         let tmpl = Template::parse(content).unwrap();
         let value = serde_json::json!({"default": {"x": 42}});
-        let rendered = tmpl.render(NotificationEvent::BlockAdded, &value).unwrap();
+        let rendered = match tmpl.render(NotificationEvent::BlockAdded, &value) {
+            RenderResult::Render(r) => r,
+            _ => panic!("expected Render"),
+        };
         // Unknown filter falls back to the raw value.
         assert_eq!(rendered.message.as_deref(), Some("42"));
     }
@@ -734,9 +844,10 @@ message = "{{invoice_payment.msat}}"
 "#;
         let tmpl = Template::parse(content).unwrap();
         let value = serde_json::json!({"invoice_payment": {"msat": "10000msat"}});
-        let rendered = tmpl
-            .render(NotificationEvent::InvoicePayment, &value)
-            .unwrap();
+        let rendered = match tmpl.render(NotificationEvent::InvoicePayment, &value) {
+            RenderResult::Render(r) => r,
+            _ => panic!("expected Render"),
+        };
         assert_eq!(rendered.message.as_deref(), Some("10000msat"));
     }
 
@@ -749,7 +860,10 @@ message = "{{invoice_payment.msat}}"
 
         let tmpl = Template::load(&path).unwrap();
         let value = serde_json::json!({"default": {"name": "world"}});
-        let rendered = tmpl.render(NotificationEvent::BlockAdded, &value).unwrap();
+        let rendered = match tmpl.render(NotificationEvent::BlockAdded, &value) {
+            RenderResult::Render(r) => r,
+            _ => panic!("expected Render"),
+        };
         assert_eq!(rendered.title.as_deref(), Some("Test"));
         assert_eq!(rendered.message.as_deref(), Some("Hello world"));
 
@@ -766,6 +880,136 @@ message = "{{invoice_payment.msat}}"
     fn empty_template_renders_none() {
         let tmpl = Template::parse("").unwrap();
         let value = serde_json::json!({});
-        assert!(tmpl.render(NotificationEvent::BlockAdded, &value).is_none());
+        assert!(matches!(
+            tmpl.render(NotificationEvent::BlockAdded, &value),
+            RenderResult::NoSection
+        ));
+    }
+
+    #[test]
+    fn filter_equal_matches() {
+        let content = r#"
+[forward_event]
+filter = "forward_event.status = settled"
+title = "Forward settled"
+"#;
+        let tmpl = Template::parse(content).unwrap();
+        let value = serde_json::json!({"forward_event": {"status": "settled"}});
+        assert!(matches!(
+            tmpl.render(NotificationEvent::ForwardEvent, &value),
+            RenderResult::Render(_)
+        ));
+    }
+
+    #[test]
+    fn filter_equal_rejects() {
+        let content = r#"
+[forward_event]
+filter = "forward_event.status = settled"
+"#;
+        let tmpl = Template::parse(content).unwrap();
+        let value = serde_json::json!({"forward_event": {"status": "offered"}});
+        assert!(matches!(
+            tmpl.render(NotificationEvent::ForwardEvent, &value),
+            RenderResult::Filtered
+        ));
+    }
+
+    #[test]
+    fn filter_not_equal() {
+        let content = r#"
+[forward_event]
+filter = "forward_event.status != offered"
+"#;
+        let tmpl = Template::parse(content).unwrap();
+        let value = serde_json::json!({"forward_event": {"status": "settled"}});
+        assert!(matches!(
+            tmpl.render(NotificationEvent::ForwardEvent, &value),
+            RenderResult::Render(_)
+        ));
+
+        let value = serde_json::json!({"forward_event": {"status": "offered"}});
+        assert!(matches!(
+            tmpl.render(NotificationEvent::ForwardEvent, &value),
+            RenderResult::Filtered
+        ));
+    }
+
+    #[test]
+    fn filter_missing_field_rejects() {
+        let content = r#"
+[forward_event]
+filter = "forward_event.status = settled"
+"#;
+        let tmpl = Template::parse(content).unwrap();
+        let value = serde_json::json!({"forward_event": {}});
+        assert!(matches!(
+            tmpl.render(NotificationEvent::ForwardEvent, &value),
+            RenderResult::Filtered
+        ));
+    }
+
+    #[test]
+    fn filter_numeric_field() {
+        let content = r#"
+[block_added]
+filter = "block_added.height = 800000"
+"#;
+        let tmpl = Template::parse(content).unwrap();
+        let value = serde_json::json!({"block_added": {"height": 800000}});
+        assert!(matches!(
+            tmpl.render(NotificationEvent::BlockAdded, &value),
+            RenderResult::Render(_)
+        ));
+
+        let value = serde_json::json!({"block_added": {"height": 799999}});
+        assert!(matches!(
+            tmpl.render(NotificationEvent::BlockAdded, &value),
+            RenderResult::Filtered
+        ));
+    }
+
+    #[test]
+    fn filter_does_not_affect_other_events() {
+        let content = r#"
+[forward_event]
+filter = "forward_event.status = settled"
+title = "Forward settled"
+
+[default]
+title = "Default"
+"#;
+        let tmpl = Template::parse(content).unwrap();
+        let value = serde_json::json!({});
+        assert!(matches!(
+            tmpl.render(NotificationEvent::BlockAdded, &value),
+            RenderResult::Render(_)
+        ));
+    }
+
+    #[test]
+    fn filter_escaped_value_matches_json() {
+        // Filter values are unescaped, so `\n` in the file matches an actual
+        // newline in the JSON payload. This is the same behavior as message
+        // values (e.g. multiline message using `\n`).
+        let content = r#"
+[forward_event]
+filter = "forward_event.message = hello\nworld"
+"#;
+        let tmpl = Template::parse(content).unwrap();
+        let value = serde_json::json!({"forward_event": {"message": "hello\nworld"}});
+        assert!(matches!(
+            tmpl.render(NotificationEvent::ForwardEvent, &value),
+            RenderResult::Render(_)
+        ));
+    }
+
+    #[test]
+    fn filter_ambiguous_operator_errors() {
+        let content = r#"
+[forward_event]
+filter = "forward_event.status =!= offered"
+"#;
+        assert!(Template::parse(content).is_err());
     }
 }

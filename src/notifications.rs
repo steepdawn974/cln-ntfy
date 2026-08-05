@@ -5,7 +5,7 @@ use cln_plugin::{Error, Plugin};
 use ntfy::Payload;
 use serde_json::Value;
 
-use crate::{NotificationEvent, PluginState, util::format};
+use crate::{NotificationEvent, PluginState, template::RenderResult, util::format};
 
 /// Send a payload to ntfy, but never propagate send errors.
 ///
@@ -28,8 +28,8 @@ async fn send(
 }
 
 /// Build a [`Payload`] either from the user's template (if configured for this
-/// event) or from the built-in default. The `event_name` and raw `value` are
-/// always available as template variables.
+/// event) or from the built-in default. Returns `None` if a template filter
+/// rejected the event (the notification should be dropped entirely).
 fn build_payload(
     p: &Plugin<PluginState>,
     event: NotificationEvent,
@@ -37,21 +37,28 @@ fn build_payload(
     default_title: &str,
     default_message: Option<&str>,
     default_tags: &[&str],
-) -> Payload {
+) -> Option<Payload> {
     // Try the user template first.
     if let Some(ref tmpl) = p.state().template {
-        if let Some(rendered) = tmpl.render(event, value) {
-            let mut payload = Payload::new(&p.state().topic);
-            if let Some(t) = rendered.title {
-                payload = payload.title(t);
+        match tmpl.render(event, value) {
+            RenderResult::Render(rendered) => {
+                let mut payload = Payload::new(&p.state().topic);
+                if let Some(t) = rendered.title {
+                    payload = payload.title(t);
+                }
+                if let Some(m) = rendered.message {
+                    payload = payload.message(m);
+                }
+                if !rendered.tags.is_empty() {
+                    payload = payload.tags(rendered.tags.iter().map(|s| s.as_str()));
+                }
+                return Some(payload);
             }
-            if let Some(m) = rendered.message {
-                payload = payload.message(m);
+            RenderResult::Filtered => {
+                log::debug!("Event {} filtered out by template filter", event.name());
+                return None;
             }
-            if !rendered.tags.is_empty() {
-                payload = payload.tags(rendered.tags.iter().map(|s| s.as_str()));
-            }
-            return payload;
+            RenderResult::NoSection => {} // fall through to built-in default
         }
     }
 
@@ -61,7 +68,7 @@ fn build_payload(
         payload = payload.message(msg);
     }
     payload = payload.tags(default_tags.iter().copied());
-    payload
+    Some(payload)
 }
 
 /// Extract an amount in satoshi from a notification payload.
@@ -108,7 +115,11 @@ pub async fn channel_opened_handler(p: Plugin<PluginState>, v: Value) -> Result<
         Some(&msg),
         &["white_check_mark"],
     );
-    send(&p, NotificationEvent::ChannelOpened, payload).await
+    if let Some(payload) = payload {
+        send(&p, NotificationEvent::ChannelOpened, payload).await
+    } else {
+        Ok(())
+    }
 }
 
 pub async fn channel_state_changed_handler(p: Plugin<PluginState>, v: Value) -> Result<(), Error> {
@@ -128,7 +139,11 @@ pub async fn channel_state_changed_handler(p: Plugin<PluginState>, v: Value) -> 
         Some(&msg),
         &["arrows_counterclockwise"],
     );
-    send(&p, NotificationEvent::ChannelStateChanged, payload).await
+    if let Some(payload) = payload {
+        send(&p, NotificationEvent::ChannelStateChanged, payload).await
+    } else {
+        Ok(())
+    }
 }
 
 pub async fn connect_handler(p: Plugin<PluginState>, v: Value) -> Result<(), Error> {
@@ -143,7 +158,11 @@ pub async fn connect_handler(p: Plugin<PluginState>, v: Value) -> Result<(), Err
         Some(&msg),
         &["electric_plug"],
     );
-    send(&p, NotificationEvent::Connect, payload).await
+    if let Some(payload) = payload {
+        send(&p, NotificationEvent::Connect, payload).await
+    } else {
+        Ok(())
+    }
 }
 
 pub async fn disconnect_handler(p: Plugin<PluginState>, v: Value) -> Result<(), Error> {
@@ -158,7 +177,11 @@ pub async fn disconnect_handler(p: Plugin<PluginState>, v: Value) -> Result<(), 
         Some(&msg),
         &["x"],
     );
-    send(&p, NotificationEvent::Disconnect, payload).await
+    if let Some(payload) = payload {
+        send(&p, NotificationEvent::Disconnect, payload).await
+    } else {
+        Ok(())
+    }
 }
 
 pub async fn invoice_creation_handler(p: Plugin<PluginState>, v: Value) -> Result<(), Error> {
@@ -175,7 +198,11 @@ pub async fn invoice_creation_handler(p: Plugin<PluginState>, v: Value) -> Resul
         Some(&msg),
         &["hourglass"],
     );
-    send(&p, NotificationEvent::InvoiceCreation, payload).await
+    if let Some(payload) = payload {
+        send(&p, NotificationEvent::InvoiceCreation, payload).await
+    } else {
+        Ok(())
+    }
 }
 
 pub async fn invoice_payment_handler(p: Plugin<PluginState>, v: Value) -> Result<(), Error> {
@@ -192,7 +219,11 @@ pub async fn invoice_payment_handler(p: Plugin<PluginState>, v: Value) -> Result
         Some(&msg),
         &["zap"],
     );
-    send(&p, NotificationEvent::InvoicePayment, payload).await
+    if let Some(payload) = payload {
+        send(&p, NotificationEvent::InvoicePayment, payload).await
+    } else {
+        Ok(())
+    }
 }
 
 pub async fn forward_event_handler(p: Plugin<PluginState>, v: Value) -> Result<(), Error> {
@@ -231,7 +262,11 @@ pub async fn forward_event_handler(p: Plugin<PluginState>, v: Value) -> Result<(
         Some(&msg),
         &["repeat"],
     );
-    send(&p, NotificationEvent::ForwardEvent, payload).await
+    if let Some(payload) = payload {
+        send(&p, NotificationEvent::ForwardEvent, payload).await
+    } else {
+        Ok(())
+    }
 }
 
 pub async fn sendpay_success_handler(p: Plugin<PluginState>, v: Value) -> Result<(), Error> {
@@ -244,7 +279,11 @@ pub async fn sendpay_success_handler(p: Plugin<PluginState>, v: Value) -> Result
         None,
         &["outbox_tray"],
     );
-    send(&p, NotificationEvent::SendpaySuccess, payload).await
+    if let Some(payload) = payload {
+        send(&p, NotificationEvent::SendpaySuccess, payload).await
+    } else {
+        Ok(())
+    }
 }
 
 pub async fn sendpay_failure_handler(p: Plugin<PluginState>, v: Value) -> Result<(), Error> {
@@ -257,7 +296,11 @@ pub async fn sendpay_failure_handler(p: Plugin<PluginState>, v: Value) -> Result
         None,
         &["warning"],
     );
-    send(&p, NotificationEvent::SendpayFailure, payload).await
+    if let Some(payload) = payload {
+        send(&p, NotificationEvent::SendpayFailure, payload).await
+    } else {
+        Ok(())
+    }
 }
 
 pub async fn coin_movement_handler(p: Plugin<PluginState>, v: Value) -> Result<(), Error> {
@@ -270,7 +313,11 @@ pub async fn coin_movement_handler(p: Plugin<PluginState>, v: Value) -> Result<(
         None,
         &["coin"],
     );
-    send(&p, NotificationEvent::CoinMovement, payload).await
+    if let Some(payload) = payload {
+        send(&p, NotificationEvent::CoinMovement, payload).await
+    } else {
+        Ok(())
+    }
 }
 
 pub async fn warning_handler(p: Plugin<PluginState>, v: Value) -> Result<(), Error> {
@@ -284,7 +331,11 @@ pub async fn warning_handler(p: Plugin<PluginState>, v: Value) -> Result<(), Err
         msg.as_deref(),
         &["warning"],
     );
-    send(&p, NotificationEvent::Warning, payload).await
+    if let Some(payload) = payload {
+        send(&p, NotificationEvent::Warning, payload).await
+    } else {
+        Ok(())
+    }
 }
 
 pub async fn block_added_handler(p: Plugin<PluginState>, v: Value) -> Result<(), Error> {
@@ -299,7 +350,11 @@ pub async fn block_added_handler(p: Plugin<PluginState>, v: Value) -> Result<(),
         msg.as_deref(),
         &["bricks"],
     );
-    send(&p, NotificationEvent::BlockAdded, payload).await
+    if let Some(payload) = payload {
+        send(&p, NotificationEvent::BlockAdded, payload).await
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

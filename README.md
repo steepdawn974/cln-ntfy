@@ -184,6 +184,31 @@ Append `| date` to convert a Unix epoch timestamp to `YYYY-MM-DD HH:MM:SS UTC`:
 | `{{forward_event.received_time \| date}}` | `2023-08-04 14:40:00 UTC` |
 | `{{forward_event.received_time / 1000 \| date}}` | Arithmetic first, then date formatting |
 
+### Event filtering
+
+Add a `filter` key to a section to only send notifications when a condition matches. This is useful for noisy events like `forward_event` which fires on every status (`offered`, `settled`, `failed`, `local_failed`).
+
+```toml
+[forward_event]
+filter = "forward_event.status = settled"
+title = "Forward settled"
+message = "In: {{forward_event.in_msat / 1000}} sat"
+```
+
+Syntax: `path.to.field op value` where `op` is `=` or `!=`.
+
+- `path` must be a dotted JSON accessor (e.g. `forward_event.status`) and may not contain `=` or `!`.
+- Values are compared as strings. Numbers match their string representation (e.g. `800000` matches `"800000"`).
+- Missing fields resolve to an empty string.
+- Filter values support the same escape sequences as other string values (`\n`, `\t`, `\\`), so `msg = hello\nworld` matches a JSON value with an actual newline.
+- When a filter rejects an event, the notification is **dropped entirely** — it does not fall back to `[default]`.
+
+| Filter | Effect |
+| --- | --- |
+| `forward_event.status = settled` | Only send settled forwards |
+| `forward_event.status != offered` | Send everything except `offered` |
+| `block_added.height = 800000` | Only send block 800000 |
+
 Available event sections: `channel_opened`, `channel_state_changed`, `connect`, `disconnect`, `invoice_creation`, `invoice_payment`, `forward_event`, `sendpay_success`, `sendpay_failure`, `coin_movement`, `warning`, `block_added`, and `default`.
 
 ## Behavior on misconfiguration
