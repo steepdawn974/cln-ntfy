@@ -1,0 +1,80 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+            artifact_name: cln-ntfy-linux-x86_64
+            artifact_pattern: "cln-ntfy-linux-x86_64.tar.gz"
+          - os: ubuntu-24.04-arm
+            name: linux-aarch64
+            artifact_name: cln-ntfy-linux-aarch64
+            artifact_pattern: "cln-ntfy-linux-aarch64.tar.gz"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile=minimal --default-toolchain stable
+          rustup override set stable
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Test
+        run: cargo test
+
+      - name: Package
+        run: |
+          cd target/release
+          strip cln-ntfy
+          tar -czf ../../${{ matrix.artifact_pattern }} cln-ntfy
+          cd ../..
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_pattern }}
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: cln-ntfy-*
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: sha256sum cln-ntfy-*.tar.gz > SHA256SUMS
+
+      - name: Create GitHub release and upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "cln-ntfy ${{ github.ref_name }}" \
+            --generate-notes \
+            cln-ntfy-*.tar.gz SHA256SUMS
